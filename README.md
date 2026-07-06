@@ -312,20 +312,4 @@ Routing is intentionally hybrid:
 
 Hydrology chat still streams through `hydrology_chat.py`. The LangGraph workflow returns `stream_required=True`, and `app.py` delegates streaming to the hydrology chat module.
 
-### Advisor workflow
 
-The advisor path is now fully controlled by `advisor_graph.py`. The old procedural `advisor_flow.py` is no longer needed in the multi-agent version.
-
----
-
-## Suggested repository description
-
-```text
-Multi-agent hydrology and build-site feasibility assistant using LangGraph, FEMA NFHL, NOAA Atlas 14, USGS terrain data, and SEIV vulnerability scoring.
-```
-
----
-
-## License
-
-Add your preferred license here before publishing. For academic/research use, consider MIT, BSD-3-Clause, or Apache-2.0 depending on how you want others to reuse the code.
