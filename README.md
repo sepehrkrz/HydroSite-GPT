@@ -1,349 +1,331 @@
-# HydroUA-GPT
+# HydroSite-GPT
 
-HydroUA-GPT is a Gradio-based application that combines two capabilities in a single chat interface:
+**HydroSite-GPT** is a multi-agent hydrology and build-site feasibility assistant that combines a domain-tuned hydrology language model with deterministic geospatial, flood, rainfall, terrain, and vulnerability tools. The system is designed for screening-level site assessment: a user can ask general hydrology questions or evaluate whether a proposed building site has flood, rainfall, terrain-drainage, and socio-economic-infrastructure vulnerability concerns.
 
-1. **Hydrology Q&A** powered by a shared language model (fine-tuned hydrology expert)
-2. **Build-site feasibility screening** for a proposed building at a specific address using geocoding, FEMA flood-hazard lookup, and a block-level vulnerability index
-
-The app routes each user message into the correct path, keeps follow-up questions within the same context when possible, and can display a location map for build-site screening results.
+The application is built with **Gradio** for the user interface and **LangGraph** for the multi-agent workflow orchestration.
 
 ---
 
-## What the app does
+## What the system does
 
-### 1) Hydrology assistant
-The hydrology path handles hydrology and water-resources questions such as runoff, floods, rainfall, groundwater, SMAP, watersheds, and related topics. Responses are streamed token-by-token from the loaded model for a chat-like experience.
+HydroSite-GPT supports two main modes:
 
-### 2) Build-site feasibility advisor
-The advisor path supports queries like:
+1. **Hydrology chat**
+   - Answers hydrology and water-resources questions.
+   - Streams responses from the local HydroUA-GPT model.
+   - Handles concepts such as runoff, rainfall, soil moisture, floods, drought, watersheds, groundwater, and stormwater.
 
-- `Can I build a warehouse at 123 Main St, Tuscaloosa AL?`
-- `hospital at 302 Reed St, Tuscaloosa AL`
-- `What is a warehouse?`
+2. **Multi-agent build-site feasibility screening**
+   - Accepts a building type and location/address.
+   - Geocodes the site.
+   - Retrieves flood hazard, rainfall frequency, terrain/drainage context, and vulnerability data.
+   - Computes a composite screening-level site risk score.
+   - Produces an explainable report with specialist-agent outputs, verifier checks, recommendations, and map location.
 
-For advisor queries, the app:
-- extracts the **building type** and **address**
-- geocodes the address using the **U.S. Census Geocoder**
-- looks up **FEMA NFHL** flood hazard at the point
-- looks up a **block-level vulnerability index** from a Parquet file
-- combines those signals into an overall tier and a simple feasibility score
-- returns a screening summary and, when coordinates are available, shows the point on an embedded map
+Example query:
+
+```text
+Can I build a hospital at 302 Reed St, Tuscaloosa AL?
+```
 
 ---
 
-## Architecture overview
+## Project architecture
 
-The app is intentionally split into focused modules so the logic is easier to maintain and update.
+```text
+HydroSite-GPT/
+├── app.py                         # Gradio UI and chat/map state handling
+├── advisor_graph.py               # Multi-agent LangGraph workflow
+├── advisor_utils.py               # Shared parsing and formatting helpers
+├── advisor_tools.py               # Geocoding, FEMA, NOAA, SEIV, terrain, scoring tools
+├── advisor_llm.py                 # Slot extraction and LLM-based interpretations
+├── router.py                      # Fast rule-based intent router
+├── llm_router.py                  # LLM fallback router
+├── hydrology_chat.py              # Streaming hydrology chat generation
+├── model_runtime.py               # Shared model/tokenizer loader
+├── requirements_langgraph.txt     # LangGraph dependencies
+└── README.md
+```
 
-### Core files
+---
 
-- `app.py` — Gradio UI, message dispatch, follow-up handling, streaming handoff, and map embed generation
-- `router.py` — rule-based first-pass intent routing
-- `llm_router.py` — LLM fallback router that can upgrade `offtopic` to `hydrology` or `advisor`
-- `hydrology_chat.py` — hydrology chat prompt construction and streaming generation
-- `advisor_flow.py` — end-to-end advisor logic and response formatting
-- `advisor_llm.py` — LLM slot filling for building type and address extraction
-- `advisor_tools.py` — geocoding, FEMA lookup, vulnerability lookup, caching, tier combination, and scoring
-- `model_runtime.py` — one-time model/tokenizer loading and reuse across modules
+## Multi-agent workflow
 
-### High-level request flow
+The build-site feasibility path is implemented as an explicit multi-agent LangGraph workflow.
 
 ```text
 User message
-   |
-   v
-Rule router (router.py)
-   |
-   +--> advisor ------------------------------+
-   |                                           |
-   |                                   advisor_flow.py
-   |                                           |
-   |                      +--------------------+-------------------+
-   |                      |                                        |
-   |                advisor_llm.py                         advisor_tools.py
-   |           (slot filling / follow-up)        (geocode + FEMA + VI + score)
-   |                                           |
-   |                                           v
-   |                                   screening response + map
-   |
-   +--> hydrology ----------------------------+
-   |                                           |
-   |                                   hydrology_chat.py
-   |                                           |
-   |                                   streamed model reply
-   |
-   +--> offtopic -> refusal / guidance
+   ↓
+Supervisor/Router Agent
+   ↓
+Planner Agent
+   ↓
+Geocoder Agent
+   ↓
+FEMA Flood Hazard Agent
+   ↓
+Rainfall/Hydrology Agent
+   ↓
+Terrain/Drainage Agent
+   ↓
+SEIV Vulnerability Agent
+   ↓
+Scoring/Synthesis Agent
+   ↓
+Critic/Verifier Agent
+   ↓
+Report Writer Agent
+   ↓
+Final screening report + map update
 ```
 
-### Routing behavior
+### Agent roles
 
-The routing logic is hybrid:
-
-- **Rules first** decide whether a message looks like hydrology, advisor, or off-topic.
-- If the rule router returns `offtopic`, the app can call an **LLM router** as a fallback.
-- Short follow-ups such as “examples” or “explain more” can inherit the previous route.
-- Weather and flood-forecast questions are treated carefully so the app does not pretend to have guaranteed real-time forecast access.
-
----
-
-## Build-site advisor logic
-
-The advisor flow is designed as a screening tool, not a formal engineering or regulatory determination.
-
-### Inputs it tries to extract
-- **Building type** such as warehouse, hospital, school, residential, industrial, or commercial
-- **Address** such as a street address or, in some cases, a city/state fallback
-
-### Data sources and processing
-1. **U.S. Census Geocoder**
-   - Converts address to latitude/longitude
-   - Attempts to recover a block GEOID
-
-2. **FEMA National Flood Hazard Layer (NFHL)**
-   - Queries the flood hazard polygon intersecting the point
-   - Interprets zone, subtype, and SFHA flag into a FEMA risk tier
-
-3. **Block-level vulnerability table**
-   - Loaded from a Parquet file referenced by `VULN_PARQUET_PATH`
-   - Looks up `Vulnerability_Index` by GEOID10
-   - Converts the value into a vulnerability tier using fixed quantile thresholds
-
-4. **Combined scoring**
-   - Uses the max of FEMA tier and vulnerability tier
-   - Applies a building-type penalty
-   - Produces a simple score, label, and recommended next steps
-
-### Important limitation
-This is a **screening-level** workflow. It is not a replacement for:
-- a surveyed site boundary
-- a local floodplain determination
-- a drainage study
-- a site-specific engineering review
-- code and ordinance review for critical facilities
+| Agent | Purpose |
+|---|---|
+| **Supervisor/Router Agent** | Classifies the user request as hydrology, advisor, or off-topic. Uses rules first and LLM fallback only when needed. |
+| **Planner Agent** | Extracts building type and address, resolves follow-up context, and decides which specialist agents should run. |
+| **Geocoder Agent** | Converts the site address into latitude, longitude, and Census GEOID. |
+| **FEMA Flood Hazard Agent** | Looks up mapped FEMA NFHL flood zone and Special Flood Hazard Area information. |
+| **Rainfall/Hydrology Agent** | Retrieves NOAA Atlas 14 rainfall frequency values and interprets extreme rainfall implications. |
+| **Terrain/Drainage Agent** | Samples local elevation context using USGS EPQS and screens for flat, convergent, or depressional terrain. |
+| **SEIV Vulnerability Agent** | Looks up block-level Socio-Economic-Infrastructure Vulnerability using a local parquet dataset. |
+| **Scoring/Synthesis Agent** | Combines FEMA, NOAA, terrain, SEIV, and building criticality into a composite site risk score. |
+| **Critic/Verifier Agent** | Checks which evidence sources succeeded, flags missing components, and prevents overclaiming. |
+| **Report Writer Agent** | Produces the final user-facing screening report with agent trace, limitations, and recommendations. |
 
 ---
 
-## Hydrology chat behavior
+## Data and external services
 
-Hydrology responses are generated from the same loaded model used elsewhere in the app. The hydrology module:
+The advisor workflow uses the following data/services:
 
-- builds a system prompt focused on hydrology and water resources
-- formats the conversation using the tokenizer chat template when available
-- streams responses using `TextIteratorStreamer`
-- keeps non-hydrology rejection out of the generation layer because routing already handles that decision
+- **U.S. Census Geocoder** for address-to-point geocoding and Census GEOID extraction.
+- **FEMA NFHL** for flood hazard zone lookup.
+- **NOAA Atlas 14** for precipitation frequency estimates.
+- **USGS EPQS / 3DEP** for local elevation samples.
+- **Local SEIV parquet dataset** for block-level vulnerability lookup.
 
-The app also includes a safety guard for forecast-style questions. Instead of inventing live weather or flood predictions, it tells the user what forecast sources and signals to check.
+The SEIV dataset path is configured in `advisor_tools.py` through the `VULN_PARQUET_PATH` environment variable.
 
----
-
-## Model loading strategy
-
-`model_runtime.py` loads the model and tokenizer once, caches them in module globals, and shares them across the rest of the application.
-
-Key points:
-- Default model path is:
-  - `/icebox/data/shares/mh2/shassan6/gradio/models/hydrology_aqua_llm_strict_11B`
-- It first tries to load via `AutoPeftModelForCausalLM`
-- If that fails, it falls back to `AutoModelForCausalLM`
-- The model is loaded with `torch.bfloat16` and `device_map="auto"`
-- `flash_attention_2` is enabled when supported
-
-Because the model is loaded up front in `app.py`, startup can take time, but repeated requests reuse the same in-memory model.
-
----
-
-## Caching
-
-The advisor utilities cache expensive lookups in SQLite databases.
-
-### Geocode cache
-- Stored in:
-  - `${SLURM_TMPDIR}/hydroua_geocode_cache_${USER}.sqlite`
-  - or `/tmp/...` if `SLURM_TMPDIR` is not set
-
-### FEMA cache
-- Stored in:
-  - `${SLURM_TMPDIR}/hydroua_fema_cache_${USER}.sqlite`
-  - or `/tmp/...`
-
-These caches reduce repeated network calls for geocoding and FEMA queries.
-
----
-
-## Environment variables
-
-The application already has sensible defaults, but these environment variables control the important runtime behavior.
-
-### App/UI
-- `HOST` — Gradio host, default: `0.0.0.0`
-- `PORT` — Gradio port, default: `7860`
-- `MAP_BASE_URL` — base URL for the embedded map view
-- `DEBUG_ROUTER` — set to `1` to print routing/debug info
-
-### Advisor data/runtime
-- `VULN_PARQUET_PATH` — path to the vulnerability Parquet file
-- `SLURM_TMPDIR` — preferred temp/cache directory on HPC
-- `FEMA_TIMEOUT` — FEMA request timeout in seconds
-- `FEMA_RETRIES` — FEMA retry count
-- `FEMA_CACHE_TTL_SECONDS` — cache lifetime for FEMA results
-- `FEMA_CACHE_DECIMALS` — coordinate rounding precision for FEMA cache keys
-- `SSL_CERT_FILE` — optional custom CA bundle
-
-### Model
-The model path is currently hardcoded inside `model_runtime.py` as `MODEL_PATH`. If you want this to be configurable, the simplest improvement is to replace that constant with an environment-variable lookup.
-
----
-
-## Python dependencies
-
-Based on the code, the app depends on the following Python packages:
-
-- `gradio`
-- `torch`
-- `transformers`
-- `duckdb`
-- `peft` (optional but preferred if the model is PEFT-based)
-- `certifi` (optional fallback for SSL certificates)
-
-It also uses only standard-library modules for:
-- threading
-- regex
-- JSON
-- SQLite
-- HTTP requests via `urllib`
-- path and environment handling
-
-A minimal install might look like:
-
-```bash
-pip install gradio torch transformers duckdb peft certifi
-```
-
-Depending on your cluster or GPU image, you may want a more controlled environment for PyTorch and CUDA.
-
----
-
-## Expected data and model paths
-
-Before launching the app, make sure the following resources exist:
-
-### 1) Model directory
 Default:
 
 ```bash
-/icebox/data/shares/mh2/shassan6/gradio/models/hydrology_aqua_llm_strict_11B
+/icebox/data/shares/mh2/mkarimiziarani/agent/data/vulnerability.parquet
 ```
 
-### 2) Vulnerability Parquet
-Default:
+Override it with:
 
 ```bash
-/icebox/data/shares/mh2/shassan6/gradio/data/vulnerability.parquet
+export VULN_PARQUET_PATH=/path/to/vulnerability.parquet
 ```
 
-### 3) Map service
-Default embedded base URL:
+---
+
+## Model configuration
+
+The local hydrology model is loaded in `model_runtime.py`.
+
+Default model path:
+
+```python
+MODEL_PATH = "/icebox/data/shares/mh2/shassan6/gradio/models/hydrology_aqua_llm_strict_11B"
+```
+
+Update this path in `model_runtime.py` if the model is stored elsewhere.
+
+The model is shared by:
+
+- `hydrology_chat.py`
+- `llm_router.py`
+- `advisor_llm.py`
+
+This avoids loading multiple copies of the same model.
+
+---
+
+## Installation
+
+Create and activate a Python environment first.
 
 ```bash
-https://homes-design-brave-anna.trycloudflare.com/
+python -m venv .venv
+source .venv/bin/activate
 ```
 
-If that map endpoint changes, set `MAP_BASE_URL` before launch.
+Install LangGraph dependencies:
+
+```bash
+pip install -r requirements_langgraph.txt
+```
+
+You may also need the project runtime dependencies if they are not already installed in your environment:
+
+```bash
+pip install gradio torch transformers peft duckdb certifi
+```
+
+Depending on your model and GPU setup, install the correct PyTorch/CUDA build for your system.
 
 ---
 
 ## Running the app
 
-From the project directory:
+From the project folder:
 
 ```bash
 python app.py
 ```
 
-By default, Gradio launches on:
+By default, the app launches on:
 
 ```text
-http://0.0.0.0:7860
+0.0.0.0:7860
 ```
 
-### Example HPC-style launch
+You can override the host and port:
 
 ```bash
 export HOST=0.0.0.0
 export PORT=7860
-export VULN_PARQUET_PATH=/path/to/vulnerability.parquet
-export MAP_BASE_URL=https://your-map-service.example.com/
 python app.py
+```
+
+The Gradio interface includes:
+
+- A chat panel for hydrology and site-screening questions.
+- A map panel that updates after successful geocoding.
+
+---
+
+## Map configuration
+
+The map iframe base URL is configured with `MAP_BASE_URL`.
+
+Default:
+
+```bash
+https://homes-design-brave-anna.trycloudflare.com/
+```
+
+Override it with:
+
+```bash
+export MAP_BASE_URL=https://your-map-app-url.example.com/
+```
+
+The app appends latitude, longitude, and zoom parameters:
+
+```text
+?lat=<lat>&lng=<lon>&z=<zoom>
 ```
 
 ---
 
 ## Example prompts
 
-### Hydrology
-- `What is a hydrograph?`
-- `Explain runoff generation in simple terms.`
-- `How does SMAP soil moisture help hydrology?`
-
-### Build-site advisor
-- `Can I build a warehouse at 123 Main St, Tuscaloosa AL?`
-- `Can I build a hospital at 302 Reed St, Tuscaloosa AL?`
-- `commercial at 2500 6th St, Tuscaloosa AL`
-
-### Definition shortcut inside advisor flow
-- `What is a warehouse?`
-- `Define hospital`
-
----
-
-## Notes on current design choices
-
-### 1) Hot reload during interaction
-`app.py` reloads several logic modules at request time using `importlib.reload(...)`. This is convenient while iterating on routing or advisor logic, but it may not be ideal for a production deployment.
-
-### 2) Shared model across tasks
-The same runtime model is reused for:
-- hydrology answer generation
-- LLM-based intent routing fallback
-- advisor slot filling
-
-This keeps the architecture simple and avoids loading separate models.
-
-### 3) Conservative handling of live forecasts
-The app explicitly avoids pretending it has guaranteed real-time weather or flood forecast data.
-
----
-
-## Suggested next improvements
-
-Some practical next steps for this project would be:
-
-1. Move `MODEL_PATH` to an environment variable
-2. Add a `requirements.txt` or `environment.yml`
-3. Add logging instead of print-based debugging
-4. Add tests for routing, slot filling, and scoring
-5. Add structured error handling around external APIs
-6. Add a deployment script for Slurm or another HPC launcher
-7. Add a configuration file for thresholds and scoring weights
-
----
-
-## Repository layout
+Hydrology:
 
 ```text
-.
-├── app.py
-├── advisor_flow.py
-├── advisor_llm.py
-├── advisor_tools.py
-├── hydrology_chat.py
-├── llm_router.py
-├── model_runtime.py
-└── router.py
+What is runoff and how does soil moisture affect it?
+```
+
+```text
+Explain the difference between infiltration, percolation, and groundwater recharge.
+```
+
+Build-site feasibility:
+
+```text
+Can I build a warehouse at 123 Main St, Tuscaloosa AL?
+```
+
+```text
+Screen a hospital site at 302 Reed St, Tuscaloosa AL.
+```
+
+Follow-up flow:
+
+```text
+Can I build a hospital?
+```
+
+The system will ask for the missing location.
+
+```text
+302 Reed St, Tuscaloosa AL
+```
+
+The planner will reuse the building type from the previous turn.
+
+---
+
+## Output report
+
+For site-screening requests, the final report includes:
+
+- Geocoded coordinates and Census GEOID.
+- Planner decision.
+- FEMA flood hazard analysis.
+- NOAA Atlas 14 rainfall intensity analysis.
+- Terrain and local drainage screening.
+- SEIV vulnerability lookup.
+- Composite site risk score.
+- Main risk drivers.
+- Integrated interpretation.
+- Critic/verifier checks and warnings.
+- Recommended next steps.
+- Agent trace.
+- Screening-level limitations.
+
+---
+
+## Important limitations
+
+HydroSite-GPT is a **screening-level decision-support tool**, not a final engineering, permitting, or legal determination.
+
+It does **not** replace:
+
+- Full hydrologic and hydraulic modeling.
+- Detailed DEM-based flow accumulation.
+- Storm sewer capacity modeling.
+- Site grading and drainage design.
+- FEMA map panel verification by a qualified professional.
+- Local floodplain ordinance review.
+- Engineering or permitting review.
+
+The system should use conservative language and avoid making final build/no-build claims unless supported by direct prohibitive evidence.
+
+---
+
+## Development notes
+
+### Intent routing
+
+Routing is intentionally hybrid:
+
+1. `router.py` handles fast deterministic rules.
+2. `llm_router.py` can upgrade uncertain/off-topic classifications to hydrology or advisor.
+3. The LangGraph supervisor uses the final route to select the correct path.
+
+### Hydrology streaming
+
+Hydrology chat still streams through `hydrology_chat.py`. The LangGraph workflow returns `stream_required=True`, and `app.py` delegates streaming to the hydrology chat module.
+
+### Advisor workflow
+
+The advisor path is now fully controlled by `advisor_graph.py`. The old procedural `advisor_flow.py` is no longer needed in the multi-agent version.
+
+---
+
+## Suggested repository description
+
+```text
+Multi-agent hydrology and build-site feasibility assistant using LangGraph, FEMA NFHL, NOAA Atlas 14, USGS terrain data, and SEIV vulnerability scoring.
 ```
 
 ---
 
-## Summary
+## License
 
-HydroUA-GPT is a single-chat Gradio app that combines a hydrology-focused LLM assistant with a lightweight build-site feasibility screening workflow. It uses hybrid routing, a shared model runtime, live geocoding and FEMA queries, local caching, and a simple map embed to keep both capabilities in one interface.
+Add your preferred license here before publishing. For academic/research use, consider MIT, BSD-3-Clause, or Apache-2.0 depending on how you want others to reuse the code.
